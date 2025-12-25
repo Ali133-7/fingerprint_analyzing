@@ -347,19 +347,13 @@ class ReportsWidget(QWidget):
                 total_working_days_df = filtered_daily_results.groupby(['Name', 'Department'])['Date'].nunique().reset_index(name='Total Working Days')
                 re_aggregated_results = re_aggregated_results.merge(total_working_days_df, on=['Name', 'Department'], how='left')
                 
-                # Calculate FinalStatus
-                re_aggregated_results['FinalStatus'] = re_aggregated_results.apply(
-                    lambda row: 'ملتزم' if row['Incomplete Days'] == 0 and row['Absent Days'] == 0 else 'غير ملتزم',
-                    axis=1
-                )
-                
                 # Ensure column order
                 column_order = [
                     'Name', 'Department', 'Total Working Days',
                     'Complete Days', 'Incomplete Days', 'Absent Days', 
                     'LateCount', 'LateMinutes',
                     'Actual Checks', 'Required Checks', 'Missing Checks',
-                    'Compliance Rate', 'FinalStatus'
+                    'Compliance Rate'
                 ]
                 
                 filtered_agg_results = re_aggregated_results[[col for col in column_order if col in re_aggregated_results.columns]]
@@ -397,17 +391,12 @@ class ReportsWidget(QWidget):
                 total_working_days_df = filtered_daily_results.groupby(['Name', 'Department'])['Date'].nunique().reset_index(name='Total Working Days')
                 re_aggregated_results = re_aggregated_results.merge(total_working_days_df, on=['Name', 'Department'], how='left')
                 
-                re_aggregated_results['FinalStatus'] = re_aggregated_results.apply(
-                    lambda row: 'ملتزم' if row['Incomplete Days'] == 0 and row['Absent Days'] == 0 else 'غير ملتزم',
-                    axis=1
-                )
-                
                 column_order = [
                     'Name', 'Department', 'Total Working Days',
-                'Complete Days', 'Incomplete Days', 'Absent Days', 
-                'LateCount', 'LateMinutes',
+                    'Complete Days', 'Incomplete Days', 'Absent Days', 
+                    'LateCount', 'LateMinutes',
                     'Actual Checks', 'Required Checks', 'Missing Checks',
-                'Compliance Rate', 'FinalStatus'
+                    'Compliance Rate'
                 ]
                 
                 filtered_agg_results = re_aggregated_results[[col for col in column_order if col in re_aggregated_results.columns]]
@@ -458,8 +447,8 @@ class ReportsWidget(QWidget):
             for row_idx, (_, row) in enumerate(self.filtered_attendance_results.iterrows()):
                 for col_idx, col_name in enumerate([
                     'Name', 'Department', 'Total Working Days',
-                    'Complete Days', 'Incomplete Days', 'Absent Days', 'Absence Reason',
-                    'LateCount', 'LateMinutes', 'Actual Checks', 'Required Checks', 'Missing Checks', 'Compliance Rate', 'FinalStatus'
+                    'Complete Days', 'Incomplete Days', 'Absent Days',
+                    'LateCount', 'LateMinutes', 'Actual Checks', 'Required Checks', 'Missing Checks', 'Compliance Rate'
                 ]):
                     if col_name in row:
                         value = str(row[col_name])

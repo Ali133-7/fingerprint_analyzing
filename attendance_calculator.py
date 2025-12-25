@@ -489,11 +489,11 @@ class AttendanceCalculator:
         
     def _match_fingerprints_to_required_times(self, fingerprints, required_times):
         """
-        Match fingerprint records to required check-in times within tolerance
+        Match fingerprint records to required check-in times
         Following the authoritative specification:
-        - Only match within tolerance window
-        - Pick closest to target datetime
-        - No AM/PM guessing or manual conversion
+        - First try to match within tolerance window
+        - If no match within tolerance, find any fingerprint after required time (even outside tolerance)
+        - CRITICAL: All fingerprints must be displayed and counted, even if outside tolerance
         - CRITICAL: Each fingerprint can only be matched to ONE required time
         """
         attendance_status = []
@@ -502,7 +502,8 @@ class AttendanceCalculator:
         # Use a set to track which fingerprint DateTime values have been used
         used_fingerprints = set()
         
-        for req_time_info in required_times:
+        # Process each required time
+        for idx, req_time_info in enumerate(required_times):
             req_time = req_time_info['time']
             req_time_str = req_time_info['time_str']
             req_description = req_time_info['description']
@@ -510,6 +511,13 @@ class AttendanceCalculator:
             # Find fingerprints within tolerance window that haven't been used yet
             tolerance_start = req_time - timedelta(minutes=self.tolerance_minutes)
             tolerance_end = req_time + timedelta(minutes=self.tolerance_minutes)
+            
+            # Find the next required time's tolerance_start (if exists)
+            # This is the boundary: if a fingerprint is after this, it belongs to the next required time
+            next_tolerance_start = None
+            if idx + 1 < len(required_times):
+                next_req_time = required_times[idx + 1]['time']
+                next_tolerance_start = next_req_time - timedelta(minutes=self.tolerance_minutes)
             
             # Find matching fingerprints within tolerance, excluding already used ones
             matching_fingerprints = fingerprints[
@@ -530,8 +538,9 @@ class AttendanceCalculator:
             
             matched = len(valid_fingerprints) > 0
             actual_time = None
+            exceeded_tolerance = False
             
-            # If matches found, pick the closest to target datetime
+            # If matches found within tolerance, pick the closest to target datetime
             if valid_fingerprints:
                 closest_fingerprint = min(valid_fingerprints, key=lambda x: abs((x['DateTime'] - req_time).total_seconds()))
                 actual_time = closest_fingerprint['DateTime']
@@ -541,20 +550,59 @@ class AttendanceCalculator:
                 
                 # Calculate delay if matched
                 delay = (actual_time - req_time).total_seconds() / 60  # Convert to minutes
+                exceeded_tolerance = delay > self.tolerance_minutes
+                
                 if self.debug_mode:
                     status = "Matched" if matched else "Not Matched"
                     delay_str = f"(Late by {delay:.1f} min)" if delay > 0 else f"(Early by {abs(delay):.1f} min)" if delay < 0 else "(On time)"
-                    print(f"DEBUG: Required {req_time_str} ({req_description}) - {status} - Actual: {actual_time.strftime('%H:%M')} {delay_str}")
+                    exceeded_str = " [EXCEEDED TOLERANCE]" if exceeded_tolerance else ""
+                    print(f"DEBUG: Required {req_time_str} ({req_description}) - {status} - Actual: {actual_time.strftime('%H:%M')} {delay_str}{exceeded_str}")
             else:
-                if self.debug_mode:
-                    print(f"DEBUG: Required {req_time_str} ({req_description}) - Not Matched - No fingerprint within tolerance [{tolerance_start.strftime('%H:%M')}-{tolerance_end.strftime('%H:%M')}]")
+                # No match within tolerance - search for late fingerprint
+                # BUT: Only if it's before the next required time's tolerance_start
+                # If it's after the next tolerance_start, consider this punch as MISSING (not matched)
+                late_fingerprints = fingerprints[
+                    (fingerprints['DateTime'] > tolerance_end) &  # After tolerance window
+                    (~fingerprints['DateTime'].isin(used_fingerprints))  # Exclude already used fingerprints
+                ]
+                
+                # If there's a next required time, filter out fingerprints that are after its tolerance_start
+                if next_tolerance_start is not None and not late_fingerprints.empty:
+                    late_fingerprints = late_fingerprints[late_fingerprints['DateTime'] < next_tolerance_start]
+                
+                if not late_fingerprints.empty:
+                    # Find the earliest late fingerprint (closest to required time)
+                    earliest_late = late_fingerprints.loc[late_fingerprints['DateTime'].idxmin()]
+                    actual_time = earliest_late['DateTime']
+                    
+                    # Mark this fingerprint as used to prevent reuse
+                    used_fingerprints.add(actual_time)
+                    
+                    # Calculate delay
+                    delay = (actual_time - req_time).total_seconds() / 60  # Convert to minutes
+                    exceeded_tolerance = True  # Definitely exceeded tolerance
+                    matched = False  # Not matched within tolerance, but we display it
+                    
+                    if self.debug_mode:
+                        print(f"DEBUG: Required {req_time_str} ({req_description}) - Not Matched within tolerance - Found late fingerprint: {actual_time.strftime('%H:%M')} (Late by {delay:.1f} min) [EXCEEDED TOLERANCE]")
+                else:
+                    # No fingerprint found - this punch is MISSING
+                    # This happens if:
+                    # 1. No fingerprint after tolerance_end, OR
+                    # 2. All fingerprints after tolerance_end are already after next_tolerance_start (belong to next required time)
+                    if self.debug_mode:
+                        if next_tolerance_start:
+                            print(f"DEBUG: Required {req_time_str} ({req_description}) - MISSING - No fingerprint found before next required time tolerance start ({next_tolerance_start.strftime('%H:%M')})")
+                        else:
+                            print(f"DEBUG: Required {req_time_str} ({req_description}) - MISSING - No fingerprint found (within or outside tolerance)")
             
             attendance_status.append({
                 'required_time': req_time,
                 'required_time_str': req_time_str,
                 'description': req_description,
-                'matched': matched,
-                'actual_time': actual_time,
+                'matched': matched,  # True only if within tolerance
+                'actual_time': actual_time,  # Can be None, within tolerance, or outside tolerance
+                'exceeded_tolerance': exceeded_tolerance,  # True if actual_time exists but outside tolerance
                 'tolerance_start': tolerance_start,
                 'tolerance_end': tolerance_end
             })
@@ -600,34 +648,45 @@ class AttendanceCalculator:
     def _calculate_attendance_metrics(self, attendance_status):
         """
         Calculate attendance metrics following the authoritative specification
-        IMPORTANT: Late is only counted if delay exceeds tolerance_minutes
+        IMPORTANT: 
+        - Late is counted if delay exceeds tolerance_minutes (even if outside tolerance window)
+        - Fingerprints outside tolerance are displayed but not counted as matched
+        - All fingerprints (even outside tolerance) affect LateCount and LateMinutes
         """
         matched_count = sum(1 for status in attendance_status if status['matched'])
         total_required = len(attendance_status)
             
         # Calculate late metrics
-        # Late is only counted if the actual time exceeds the required time by MORE than tolerance_minutes
+        # Late is counted if:
+        # 1. Matched within tolerance but delay > tolerance_minutes, OR
+        # 2. Found outside tolerance window (exceeded_tolerance = True)
         late_count = 0
         late_minutes = 0
             
         for status in attendance_status:
-            if status['matched']:
-                # Calculate delay if the actual time is after the required time
-                if status['actual_time'] and status['required_time']:
-                    delay = (status['actual_time'] - status['required_time']).total_seconds() / 60  # Convert to minutes
-                    # Only count as late if delay exceeds tolerance_minutes
-                    # If delay is within tolerance (0 to tolerance_minutes), it's not considered late
-                    if delay > self.tolerance_minutes:
-                        late_count += 1
-                        # Only count the minutes beyond tolerance as late minutes
-                        late_minutes += (delay - self.tolerance_minutes)
+            if status['actual_time'] and status['required_time']:
+                delay = (status['actual_time'] - status['required_time']).total_seconds() / 60  # Convert to minutes
+                
+                # Count as late if:
+                # 1. Matched within tolerance but delay > tolerance_minutes, OR
+                # 2. Exceeded tolerance (found outside tolerance window)
+                if status.get('exceeded_tolerance', False):
+                    # Fingerprint outside tolerance window - definitely late
+                    late_count += 1
+                    # LateMinutes = actual_time - required_time - tolerance
+                    late_minutes += (delay - self.tolerance_minutes)
+                elif status['matched'] and delay > self.tolerance_minutes:
+                    # Matched within tolerance but delay exceeds tolerance_minutes
+                    late_count += 1
+                    # Only count the minutes beyond tolerance as late minutes
+                    late_minutes += (delay - self.tolerance_minutes)
             
         metrics = {
             'Required Checks': total_required,
-            'Actual Checks': matched_count,
-            'Missing Checks': total_required - matched_count,
-            'LateCount': late_count,
-            'LateMinutes': late_minutes
+            'Actual Checks': matched_count,  # Only counts matched within tolerance
+            'Missing Checks': total_required - matched_count,  # Only counts missing (not matched within tolerance)
+            'LateCount': late_count,  # Includes both matched late and exceeded_tolerance
+            'LateMinutes': late_minutes  # Includes both matched late and exceeded_tolerance
         }
             
         if total_required > 0:
@@ -697,7 +756,7 @@ class AttendanceCalculator:
             'Complete Days', 'Incomplete Days', 'Absent Days', 
             'LateCount', 'LateMinutes',
             'Required Checks', 'Actual Checks', 'Missing Checks',
-            'Compliance Rate', 'Absence Reason', 'FinalStatus'
+            'Compliance Rate'
         ]
         
         # Ensure all columns exist
@@ -709,7 +768,6 @@ class AttendanceCalculator:
         # Every absence_threshold missing punches = 1 absence day
         # Example: 12 missing punches with threshold=3 = 4 absence days
         employee_summary['Absent Days'] = 0
-        employee_summary['Absence Reason'] = ''
         
         for idx, row in employee_summary.iterrows():
             missing_checks = row.get('Missing Checks', 0)
@@ -717,26 +775,6 @@ class AttendanceCalculator:
             if missing_checks > 0:
                 absence_days = missing_checks // self.absence_threshold
                 employee_summary.loc[idx, 'Absent Days'] = absence_days
-                
-                # Create absence reason
-                if absence_days > 0:
-                    reason = f"عدد البصمات المتروكة: {missing_checks}، كل {self.absence_threshold} بصمة = يوم غياب"
-                    employee_summary.loc[idx, 'Absence Reason'] = reason
-                else:
-                    employee_summary.loc[idx, 'Absence Reason'] = f"عدد البصمات المتروكة: {missing_checks} (أقل من عتبة الغياب)"
-            else:
-                employee_summary.loc[idx, 'Absence Reason'] = "لا توجد بصمات متروكة"
-        
-        # Calculate FinalStatus according to the specification
-        # IF IncompleteDays == 0 AND AbsentDays == 0: FinalStatus = "ملتزم" ELSE: "غير ملتزم"
-        # Add this as a separate column in the final output
-        employee_summary['FinalStatus'] = employee_summary.apply(
-            lambda row: 'ملتزم' if row['Incomplete Days'] == 0 and row['Absent Days'] == 0 else 'غير ملتزم',
-            axis=1
-        )
-        
-        # Add FinalStatus to the column order
-        column_order.append('FinalStatus')
         
         return employee_summary[column_order]
     

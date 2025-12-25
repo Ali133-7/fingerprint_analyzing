@@ -31,7 +31,6 @@ class ReportGenerator:
             'Required Checks': 'البصمات المطلوبة',
             'Missing Checks': 'البصمات المفقودة',
             'Compliance Rate': 'نسبة الالتزام %',
-            'FinalStatus': 'الحالة النهائية',
             # Daily Details
             'Date': 'التاريخ',
             'Day Status': 'الحالة اليومية',
@@ -90,13 +89,16 @@ class ReportGenerator:
             # Sheet 2: Daily Attendance Details
             self._write_daily_details_sheet(writer, daily_details_data)
             
-            # Sheet 3: Absences (الغيابات)
+            # Sheet 3: Daily Attendance Sheet (تفاصيل الحضور اليومي)
+            self._write_daily_attendance_sheet(writer, daily_details_data)
+            
+            # Sheet 4: Absences (الغيابات)
             self._write_absences_sheet(writer, employee_summary_data)
             
-            # Sheet 4: Missing Punches (البصمات المتروكة)
+            # Sheet 5: Missing Punches (البصمات المتروكة)
             self._write_missing_punches_sheet(writer, daily_details_data)
             
-            # Sheet 5: Raw Fingerprint Matching Log
+            # Sheet 6: Raw Fingerprint Matching Log
             self._write_matching_log_sheet(writer, daily_details_data)
         
         return filepath
@@ -215,13 +217,20 @@ class ReportGenerator:
             for status in attendance_status:
                 if not isinstance(status, dict):
                     continue
-                if not status.get('matched', False):
-                    continue
-                    
+                
                 actual_time = status.get('actual_time')
                 required_time = status.get('required_time')
                 if actual_time is None or required_time is None:
                     continue
+                
+                # Include if:
+                # 1. Matched within tolerance and delay > tolerance_minutes, OR
+                # 2. Exceeded tolerance (outside tolerance window)
+                matched = status.get('matched', False)
+                exceeded_tolerance = status.get('exceeded_tolerance', False)
+                
+                if not matched and not exceeded_tolerance:
+                    continue  # Skip if no fingerprint found
                     
                 try:
                     # Calculate delay in minutes
@@ -253,15 +262,17 @@ class ReportGenerator:
                         except:
                             continue
                     
-                    # Only count as late if delay exceeds tolerance_minutes
-                    # If delay is within tolerance (0 to tolerance_minutes), it's not considered late
-                    if delay > self.tolerance_minutes:
+                    # Count as late if:
+                    # 1. Matched within tolerance but delay > tolerance_minutes, OR
+                    # 2. Exceeded tolerance (outside tolerance window)
+                    if exceeded_tolerance or (matched and delay > self.tolerance_minutes):
+                        late_minutes = int(delay - self.tolerance_minutes)  # Only count minutes beyond tolerance
                         late_data.append({
                             'اسم الموظف': row.get('Name', 'N/A'),
                             'التاريخ': row.get('Date', 'N/A'),
                             'الوقت المطلوب': status.get('required_time_str', 'N/A'),
                             'الوقت الفعلي': actual_time.strftime('%H:%M:%S') if hasattr(actual_time, 'strftime') else str(actual_time),
-                            'التأخير (بالدقائق)': int(delay - self.tolerance_minutes)  # Only count minutes beyond tolerance
+                            'التأخير (بالدقائق)': late_minutes
                         })
                 except (AttributeError, TypeError, ValueError) as e:
                     # Skip this entry if there's an error calculating delay
@@ -296,6 +307,8 @@ class ReportGenerator:
                 tolerance_end = status.get('tolerance_end')
                 actual_time = status.get('actual_time')
                 matched = status.get('matched', False)
+                exceeded_tolerance = status.get('exceeded_tolerance', False)
+                required_time = status.get('required_time')
                 
                 # Format tolerance window safely
                 if tolerance_start is not None and hasattr(tolerance_start, 'strftime'):
@@ -309,33 +322,49 @@ class ReportGenerator:
                     tolerance_end_str = 'N/A'
                 
                 # Format actual time safely
-                if matched and actual_time is not None and hasattr(actual_time, 'strftime'):
-                    actual_time_str = actual_time.strftime('%H:%M:%S')
+                actual_time_str = '—'
+                delay_minutes = None
+                if actual_time is not None and hasattr(actual_time, 'strftime'):
+                    actual_time_str = actual_time.strftime('%H:%M')
+                    if required_time and hasattr(required_time, 'strftime'):
+                        delay_seconds = (actual_time - required_time).total_seconds()
+                        delay_minutes = int(delay_seconds / 60)
+                
+                # Determine match status
+                if exceeded_tolerance:
+                    match_status = 'تجاوز نافذة السماح'
+                elif matched:
+                    match_status = 'مطابق'
                 else:
-                    actual_time_str = 'N/A'
+                    match_status = 'غير مطابق'
                 
                 log_data.append({
                     'اسم الموظف': row['Name'],
                     'التاريخ': row['Date'],
                     'الوقت المطلوب': status.get('required_time_str', 'N/A'),
+                    'الوقت الفعلي': actual_time_str,
+                    'التأخير (دقيقة)': delay_minutes if delay_minutes is not None else '—',
                     'نافذة التسامح': f"{tolerance_start_str} - {tolerance_end_str}",
-                    'نتيجة المطابقة': 'مطابق' if matched else 'غير مطابق',
-                    'البصمة المطابقة': actual_time_str,
-                    'سبب الفشل': '' if matched else 'لم يتم العثور على بصمة ضمن نافذة التسامح'
+                    'الحالة': match_status
                 })
         
         log_df = pd.DataFrame(log_data)
         if not log_df.empty:
+            # Reorder columns for better readability
+            column_order = ['اسم الموظف', 'التاريخ', 'الوقت المطلوب', 'الوقت الفعلي', 
+                          'التأخير (دقيقة)', 'نافذة التسامح', 'الحالة']
+            log_df = log_df[column_order]
+            
             log_df.to_excel(writer, sheet_name='سجل مطابقة البصمات', index=False)
             ws = writer.sheets['سجل مطابقة البصمات']
-            self._format_sheet(ws, {})
+            self._format_matching_log_sheet(ws)
         else:
             # Create empty sheet with headers
-            empty_df = pd.DataFrame(columns=['اسم الموظف', 'التاريخ', 'الوقت المطلوب', 'نافذة التسامح', 
-                                            'نتيجة المطابقة', 'البصمة المطابقة', 'سبب الفشل'])
+            empty_df = pd.DataFrame(columns=['اسم الموظف', 'التاريخ', 'الوقت المطلوب', 'الوقت الفعلي', 
+                                            'التأخير (دقيقة)', 'نافذة التسامح', 'الحالة'])
             empty_df.to_excel(writer, sheet_name='سجل مطابقة البصمات', index=False)
             ws = writer.sheets['سجل مطابقة البصمات']
-            self._format_sheet(ws, {})
+            self._format_matching_log_sheet(ws)
     
     def _write_missing_punches_sheet(self, writer, data):
         """
@@ -362,7 +391,6 @@ class ReportGenerator:
                 matched = status.get('matched', False)
                 if not matched:  # This is a missing punch
                     required_time_str = status.get('required_time_str', 'N/A')
-                    description = status.get('description', 'N/A')
                     tolerance_start = status.get('tolerance_start')
                     tolerance_end = status.get('tolerance_end')
                     
@@ -384,7 +412,6 @@ class ReportGenerator:
                         'القسم': emp_dept,
                         'التاريخ': date,
                         'الوقت المطلوب': required_time_str,
-                        'الوصف': description,
                         'نافذة التسامح': tolerance_window,
                         'الحالة': 'لم يبصم'
                     })
@@ -401,11 +428,460 @@ class ReportGenerator:
         else:
             # Create empty sheet with headers
             empty_df = pd.DataFrame(columns=['اسم الموظف', 'القسم', 'التاريخ', 'الوقت المطلوب', 
-                                            'الوصف', 'نافذة التسامح', 'الحالة'])
+                                            'نافذة التسامح', 'الحالة'])
             empty_df.to_excel(writer, sheet_name='البصمات المتروكة', index=False)
             ws = writer.sheets['البصمات المتروكة']
             self._format_sheet(ws, {})
     
+    def _write_daily_attendance_sheet(self, writer, data):
+        """
+        Create detailed daily attendance sheet with time columns
+        Each row represents one employee + one day
+        Columns: اسم الموظف، التاريخ، 08:00، 12:00، 15:00، 20:00، 23:00، 08:00 (اليوم التالي)،
+                 تأخير، تارك بصمة، قبل، ملاحظة
+        """
+        import ast
+        
+        sheet_data = []
+        
+        # Process each row in daily_details_data
+        for _, row in data.iterrows():
+            emp_name = row.get('Name', 'N/A')
+            date = row.get('Date', 'N/A')
+            day_status = row.get('Day Status', 'N/A')
+            late_count = row.get('LateCount', 0)
+            missing_checks = row.get('Missing Checks', 0)
+            
+            # Get attendance status
+            attendance_status = row.get('Attendance Status', [])
+            
+            # Handle case where Attendance Status might be stored as string
+            if isinstance(attendance_status, str):
+                try:
+                    attendance_status = ast.literal_eval(attendance_status)
+                except:
+                    attendance_status = []
+            
+            if not isinstance(attendance_status, list):
+                attendance_status = []
+            
+            # Convert date to datetime for comparison
+            if hasattr(date, 'date'):
+                shift_date = date.date() if hasattr(date, 'date') else date
+            elif hasattr(date, 'strftime'):
+                try:
+                    shift_date = datetime.strptime(str(date), '%Y-%m-%d').date()
+                except:
+                    shift_date = date
+            else:
+                try:
+                    shift_date = datetime.strptime(str(date), '%Y-%m-%d').date()
+                except:
+                    shift_date = date
+            
+            # Create a dictionary to store time punches
+            # Key: (req_time_str, is_next_day) to handle duplicate "08:00"
+            time_punches = {}
+            early_count = 0  # Count early arrivals (before required time)
+            
+            # Process attendance status and determine order
+            status_list_with_index = []
+            for idx, status in enumerate(attendance_status):
+                if not isinstance(status, dict):
+                    continue
+                
+                req_time_str = status.get('required_time_str', '')
+                required_time = status.get('required_time')
+                matched = status.get('matched', False)
+                actual_time = status.get('actual_time')
+                
+                # Check if this is next day (by comparing date of required_time with shift_date)
+                is_next_day = False
+                if required_time and hasattr(required_time, 'date'):
+                    req_date = required_time.date()
+                    if isinstance(shift_date, type(req_date)):
+                        is_next_day = req_date > shift_date
+                
+                # Create key: use index to distinguish duplicate time strings
+                # The last one in the list is typically the next day one
+                key = (req_time_str, idx, is_next_day)
+                status_list_with_index.append((key, status, req_time_str, is_next_day))
+                
+                # Check if exceeded tolerance (outside tolerance window)
+                exceeded_tolerance = status.get('exceeded_tolerance', False)
+                
+                if actual_time and required_time:
+                    # Format actual time as HH:MM
+                    if hasattr(actual_time, 'strftime'):
+                        time_str = actual_time.strftime('%H:%M')
+                    else:
+                        time_str = str(actual_time)
+                    
+                    # Calculate delay
+                    delay = (actual_time - required_time).total_seconds() / 60
+                    is_late = delay > self.tolerance_minutes
+                    is_early = delay < -self.tolerance_minutes
+                    
+                    if is_early:
+                        early_count += 1
+                    
+                    time_punches[key] = {
+                        'time': time_str,
+                        'matched': matched,  # True only if within tolerance
+                        'is_late': is_late,
+                        'is_early': is_early,
+                        'exceeded_tolerance': exceeded_tolerance,  # True if outside tolerance window
+                        'delay': delay,
+                        'req_time_str': req_time_str,
+                        'is_next_day': is_next_day,
+                        'index': idx
+                    }
+                else:
+                    # Missing punch
+                    time_punches[key] = {
+                        'time': '—',
+                        'matched': False,
+                        'is_late': False,
+                        'is_early': False,
+                        'exceeded_tolerance': False,
+                        'delay': None,
+                        'req_time_str': req_time_str,
+                        'is_next_day': is_next_day,
+                        'index': idx
+                    }
+            
+            # Build row data
+            row_data = {
+                'اسم الموظف': emp_name,
+                'التاريخ': date.strftime('%Y-%m-%d') if hasattr(date, 'strftime') else str(date),
+            }
+            
+            # Map time columns - use the order from attendance_status
+            # Expected columns: 08:00, 12:00, 15:00, 20:00, 23:00, 08:00 (اليوم التالي)
+            column_mapping = []
+            for key, status, req_time_str, is_next_day in status_list_with_index:
+                if req_time_str == '08:00' and is_next_day:
+                    col_name = '08:00 (اليوم التالي)'
+                else:
+                    col_name = req_time_str
+                column_mapping.append((col_name, key))
+            
+            # Fill time columns based on attendance_status order
+            # Map each status to its column name, avoiding duplicates
+            filled_columns = set()
+            
+            # First, handle next day 08:00 (should be last)
+            next_day_08_found = False
+            for key, status, req_time_str, is_next_day in status_list_with_index:
+                if req_time_str == '08:00' and is_next_day:
+                    col_name = '08:00 (اليوم التالي)'
+                    if col_name not in filled_columns:
+                        if key in time_punches:
+                            row_data[col_name] = time_punches[key]['time']
+                        else:
+                            row_data[col_name] = '—'
+                        filled_columns.add(col_name)
+                        next_day_08_found = True
+                    break
+            
+            # Then, handle regular time columns (in order, but skip next day 08:00)
+            for key, status, req_time_str, is_next_day in status_list_with_index:
+                if req_time_str == '08:00' and is_next_day:
+                    continue  # Skip, already handled
+                
+                col_name = req_time_str
+                if col_name not in filled_columns:
+                    if key in time_punches:
+                        row_data[col_name] = time_punches[key]['time']
+                    else:
+                        row_data[col_name] = '—'
+                    filled_columns.add(col_name)
+            
+            # Ensure all expected columns exist (fill missing ones with —)
+            expected_time_columns = ['08:00', '12:00', '15:00', '20:00', '23:00', '08:00 (اليوم التالي)']
+            for col_name in expected_time_columns:
+                if col_name not in row_data:
+                    row_data[col_name] = '—'
+            
+            # Add status columns
+            row_data['تأخير'] = late_count
+            row_data['تارك بصمة'] = missing_checks
+            row_data['قبل'] = 1 if early_count > 0 else 0
+            row_data['ملاحظة'] = day_status  # Use day status as note
+            
+            sheet_data.append(row_data)
+        
+        # Create DataFrame
+        df = pd.DataFrame(sheet_data)
+        
+        # Ensure all columns are present (in case some are missing)
+        expected_columns = ['اسم الموظف', 'التاريخ', '08:00', '12:00', '15:00', '20:00', 
+                          '23:00', '08:00 (اليوم التالي)', 'تأخير', 'تارك بصمة', 'قبل', 'ملاحظة']
+        for col in expected_columns:
+            if col not in df.columns:
+                df[col] = ''
+        
+        # Reorder columns to match expected order
+        df = df[expected_columns]
+        
+        # Sort: التاريخ (تصاعدي), اسم الموظف (أبجدي), الحالة (مستوفي → نقص بصمة → غياب)
+        # Create sort key for status
+        def get_status_sort_key(status_str):
+            if not isinstance(status_str, str):
+                return 3
+            if status_str == 'مستوفي':
+                return 0
+            elif status_str.startswith('نقص بصمة'):
+                return 1
+            elif status_str == 'غائب':
+                return 2
+            else:
+                return 3
+        
+        df['_status_sort'] = df['ملاحظة'].apply(get_status_sort_key)
+        df = df.sort_values(['التاريخ', 'اسم الموظف', '_status_sort'])
+        df = df.drop('_status_sort', axis=1)
+        
+        # Write to Excel
+        if not df.empty:
+            df.to_excel(writer, sheet_name='تفاصيل الحضور اليومي', index=False)
+            ws = writer.sheets['تفاصيل الحضور اليومي']
+            
+            # Format sheet with colors
+            self._format_daily_attendance_sheet(ws, data)
+        else:
+            # Create empty sheet with headers
+            empty_df = pd.DataFrame(columns=expected_columns)
+            empty_df.to_excel(writer, sheet_name='تفاصيل الحضور اليومي', index=False)
+            ws = writer.sheets['تفاصيل الحضور اليومي']
+            self._format_daily_attendance_sheet(ws, pd.DataFrame())
+    
+    def _format_daily_attendance_sheet(self, ws, original_data):
+        """
+        Format the daily attendance sheet with colors and styling
+        """
+        import ast
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        
+        # Header formatting
+        header_font = Font(bold=True, name='Arial', size=11, color="FFFFFF")
+        header_fill = PatternFill(start_color="808080", end_color="808080", fill_type="solid")  # Gray background
+        header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        
+        # Format header row
+        for cell in ws[1]:
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = header_alignment
+        
+        # Get column indices
+        col_indices = {}
+        for idx, cell in enumerate(ws[1], 1):
+            col_indices[cell.value] = idx
+        
+        # Define time column names (in order)
+        time_columns = ['08:00', '12:00', '15:00', '20:00', '23:00', '08:00 (اليوم التالي)']
+        
+        # Color definitions
+        green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")  # Light green
+        late_red_fill = PatternFill(start_color="DC143C", end_color="DC143C", fill_type="solid")  # Crimson red for late punches (within tolerance but late)
+        red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")  # Light red for missing punches
+        bordo_fill = PatternFill(start_color="800000", end_color="800000", fill_type="solid")  # Bordo/Dark red for exceeded tolerance (outside tolerance window)
+        gray_fill = PatternFill(start_color="D3D3D3", end_color="D3D3D3", fill_type="solid")  # Gray
+        
+        # Process each data row (starting from row 2)
+        for row_idx in range(2, ws.max_row + 1):
+            # Get employee name and date to find original data
+            emp_name = ws.cell(row=row_idx, column=col_indices.get('اسم الموظف', 1)).value
+            date_str = ws.cell(row=row_idx, column=col_indices.get('التاريخ', 2)).value
+            
+            # Find corresponding row in original data
+            attendance_status_list = []
+            if not original_data.empty:
+                matching_rows = original_data[
+                    (original_data['Name'] == emp_name) & 
+                    (original_data['Date'].astype(str) == str(date_str))
+                ]
+                if not matching_rows.empty:
+                    att_status = matching_rows.iloc[0].get('Attendance Status', [])
+                    if isinstance(att_status, str):
+                        try:
+                            attendance_status_list = ast.literal_eval(att_status)
+                        except:
+                            attendance_status_list = []
+                    elif isinstance(att_status, list):
+                        attendance_status_list = att_status
+            
+            # Get shift date for comparison
+            try:
+                shift_date = datetime.strptime(str(date_str), '%Y-%m-%d').date()
+            except:
+                shift_date = None
+            
+            # Create map of (req_time_str, is_next_day, index) to status info
+            time_status_map = {}
+            for idx, status in enumerate(attendance_status_list):
+                if isinstance(status, dict):
+                    req_time_str = status.get('required_time_str', '')
+                    matched = status.get('matched', False)
+                    actual_time = status.get('actual_time')
+                    required_time = status.get('required_time')
+                    
+                    # Check if this is next day
+                    is_next_day = False
+                    if required_time and shift_date and hasattr(required_time, 'date'):
+                        req_date = required_time.date()
+                        is_next_day = req_date > shift_date
+                    
+                    key = (req_time_str, idx, is_next_day)
+                    
+                    if matched and actual_time and required_time:
+                        delay = (actual_time - required_time).total_seconds() / 60
+                        is_late = delay > self.tolerance_minutes
+                        exceeded_tolerance = status.get('exceeded_tolerance', False)
+                        time_status_map[key] = {
+                            'matched': True, 
+                            'is_late': is_late, 
+                            'exceeded_tolerance': exceeded_tolerance,
+                            'req_time_str': req_time_str, 
+                            'is_next_day': is_next_day
+                        }
+                    elif actual_time and required_time:
+                        # Has actual_time but not matched (exceeded tolerance)
+                        delay = (actual_time - required_time).total_seconds() / 60
+                        exceeded_tolerance = status.get('exceeded_tolerance', False)
+                        time_status_map[key] = {
+                            'matched': False, 
+                            'is_late': True,  # Always late if exceeded tolerance
+                            'exceeded_tolerance': exceeded_tolerance,
+                            'req_time_str': req_time_str, 
+                            'is_next_day': is_next_day
+                        }
+                    else:
+                        time_status_map[key] = {
+                            'matched': False, 
+                            'is_late': False, 
+                            'exceeded_tolerance': False,
+                            'req_time_str': req_time_str, 
+                            'is_next_day': is_next_day
+                        }
+            
+            # Color time columns
+            for time_col in time_columns:
+                if time_col in col_indices:
+                    col_idx = col_indices[time_col]
+                    cell = ws.cell(row=row_idx, column=col_idx)
+                    
+                    cell_value = cell.value
+                    is_next_day_col = time_col == '08:00 (اليوم التالي)'
+                    
+                    if cell_value and cell_value != '—':
+                        # Has fingerprint - check if late or on time
+                        # Find matching status (handle next day case)
+                        found_status = None
+                        for key, status_info in time_status_map.items():
+                            req_time_str, idx, is_next_day = key
+                            if is_next_day_col:
+                                if status_info['req_time_str'] == '08:00' and status_info['is_next_day']:
+                                    found_status = status_info
+                                    break
+                            else:
+                                if status_info['req_time_str'] == time_col and not status_info['is_next_day']:
+                                    found_status = status_info
+                                    break
+                        
+                        if found_status:
+                            # Check if exceeded tolerance first (highest priority)
+                            if found_status.get('exceeded_tolerance', False):
+                                cell.fill = bordo_fill  # Bordo: exceeded tolerance (outside tolerance window)
+                            elif found_status['matched']:
+                                if found_status['is_late']:
+                                    cell.fill = late_red_fill  # Crimson red: late but within tolerance window
+                                else:
+                                    cell.fill = green_fill  # Green: on time
+                            else:
+                                # Has actual_time but not matched (should not happen normally)
+                                cell.fill = bordo_fill  # Bordo: exceeded tolerance
+                        else:
+                            cell.fill = green_fill  # Default to green if status not found
+                    else:
+                        # Missing fingerprint - red
+                        cell.fill = red_fill
+            
+            # Format status columns
+            # تأخير column
+            if 'تأخير' in col_indices:
+                delay_col = col_indices['تأخير']
+                delay_cell = ws.cell(row=row_idx, column=delay_col)
+                delay_value = delay_cell.value
+                try:
+                    delay_int = int(delay_value) if delay_value is not None else 0
+                    if delay_int == 0:
+                        delay_cell.fill = green_fill
+                    else:
+                        delay_cell.fill = late_red_fill  # Crimson red for late punches
+                except:
+                    pass
+            
+            # تارك بصمة column
+            if 'تارك بصمة' in col_indices:
+                missing_col = col_indices['تارك بصمة']
+                missing_cell = ws.cell(row=row_idx, column=missing_col)
+                missing_value = missing_cell.value
+                try:
+                    missing_int = int(missing_value) if missing_value is not None else 0
+                    if missing_int == 0:
+                        missing_cell.fill = green_fill
+                    else:
+                        missing_cell.fill = red_fill
+                except:
+                    pass
+            
+            # قبل column
+            if 'قبل' in col_indices:
+                early_col = col_indices['قبل']
+                early_cell = ws.cell(row=row_idx, column=early_col)
+                early_value = early_cell.value
+                try:
+                    early_int = int(early_value) if early_value is not None else 0
+                    if early_int == 1:
+                        early_cell.fill = green_fill
+                    else:
+                        early_cell.fill = gray_fill
+                except:
+                    pass
+        
+        # Set column widths
+        column_widths = {
+            'اسم الموظف': 20,
+            'التاريخ': 12,
+            '08:00': 10,
+            '12:00': 10,
+            '15:00': 10,
+            '20:00': 10,
+            '23:00': 10,
+            '08:00 (اليوم التالي)': 18,
+            'تأخير': 10,
+            'تارك بصمة': 12,
+            'قبل': 8,
+            'ملاحظة': 20
+        }
+        
+        for col_name, width in column_widths.items():
+            if col_name in col_indices:
+                col_letter = ws.cell(row=1, column=col_indices[col_name]).column_letter
+                ws.column_dimensions[col_letter].width = width
+        
+        # Set RTL alignment for all cells
+        cell_alignment = Alignment(horizontal="right", vertical="center", wrap_text=True)
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
+            for cell in row:
+                if cell.alignment.horizontal is None or cell.alignment.horizontal == 'general':
+                    cell.alignment = cell_alignment
+        
+        # Enable filters
+        ws.auto_filter.ref = ws.dimensions
+
     def _write_absences_sheet(self, writer, data):
         """
         Create a sheet showing absences with reasons, sorted by employee name
@@ -420,7 +896,6 @@ class ReportGenerator:
                     'القسم': row.get('Department', 'N/A'),
                     'عدد أيام الغياب': absent_days,
                     'عدد البصمات المتروكة': row.get('Missing Checks', 0),
-                    'سبب الغياب': row.get('Absence Reason', 'N/A'),
                     'عدد أيام الدوام': row.get('Total Working Days', 0),
                     'نسبة الالتزام %': row.get('Compliance Rate', 0)
                 })
@@ -439,12 +914,113 @@ class ReportGenerator:
         else:
             # Create empty sheet with headers
             empty_df = pd.DataFrame(columns=['اسم الموظف', 'القسم', 'عدد أيام الغياب', 
-                                            'عدد البصمات المتروكة', 'سبب الغياب', 
+                                            'عدد البصمات المتروكة', 
                                             'عدد أيام الدوام', 'نسبة الالتزام %'])
             empty_df.to_excel(writer, sheet_name='الغيابات', index=False)
             ws = writer.sheets['الغيابات']
             self._format_sheet(ws, {})
 
+    def _format_matching_log_sheet(self, ws):
+        """
+        Format the matching log sheet with professional styling
+        """
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        
+        # Header formatting - professional blue gradient
+        header_font = Font(bold=True, name='Arial', size=11, color="FFFFFF")
+        header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")  # Professional blue
+        header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        
+        # Format header row
+        for cell in ws[1]:
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = header_alignment
+        
+        # Get column indices
+        col_indices = {}
+        for idx, cell in enumerate(ws[1], 1):
+            col_indices[cell.value] = idx
+        
+        # Color definitions
+        green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")  # Light green for matched
+        late_red_fill = PatternFill(start_color="DC143C", end_color="DC143C", fill_type="solid")  # Crimson red for late
+        bordo_fill = PatternFill(start_color="800000", end_color="800000", fill_type="solid")  # Bordo for exceeded tolerance
+        red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")  # Light red for not matched
+        
+        # Format data rows
+        for row_idx in range(2, ws.max_row + 1):
+            # Get status value
+            status_col_idx = col_indices.get('الحالة')
+            if status_col_idx:
+                status_cell = ws.cell(row=row_idx, column=status_col_idx)
+                status_value = status_cell.value
+                
+                # Color code based on status
+                if status_value == 'مطابق':
+                    status_cell.fill = green_fill
+                elif status_value == 'تجاوز نافذة السماح':
+                    status_cell.fill = bordo_fill
+                    # Also color the actual time cell
+                    if 'الوقت الفعلي' in col_indices:
+                        actual_time_cell = ws.cell(row=row_idx, column=col_indices['الوقت الفعلي'])
+                        actual_time_cell.fill = bordo_fill
+                elif status_value == 'غير مطابق':
+                    status_cell.fill = red_fill
+            
+            # Color delay column if late
+            if 'التأخير (دقيقة)' in col_indices:
+                delay_col = col_indices['التأخير (دقيقة)']
+                delay_cell = ws.cell(row=row_idx, column=delay_col)
+                delay_value = delay_cell.value
+                if delay_value and delay_value != '—':
+                    try:
+                        delay_int = int(delay_value) if delay_value is not None else 0
+                        if delay_int > 0:
+                            delay_cell.fill = late_red_fill
+                    except:
+                        pass
+        
+        # Set column widths for optimal readability
+        column_widths = {
+            'اسم الموظف': 20,
+            'التاريخ': 12,
+            'الوقت المطلوب': 15,
+            'الوقت الفعلي': 15,
+            'التأخير (دقيقة)': 18,
+            'نافذة التسامح': 20,
+            'الحالة': 20
+        }
+        
+        for col_name, width in column_widths.items():
+            if col_name in col_indices:
+                col_letter = ws.cell(row=1, column=col_indices[col_name]).column_letter
+                ws.column_dimensions[col_letter].width = width
+        
+        # Set RTL alignment for all cells
+        cell_alignment = Alignment(horizontal="right", vertical="center", wrap_text=True)
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
+            for cell in row:
+                if cell.alignment.horizontal is None or cell.alignment.horizontal == 'general':
+                    cell.alignment = cell_alignment
+        
+        # Add borders for better readability
+        thin_border = Border(
+            left=Side(style='thin'),
+            right=Side(style='thin'),
+            top=Side(style='thin'),
+            bottom=Side(style='thin')
+        )
+        
+        for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
+            for cell in row:
+                cell.border = thin_border
+        
+        # Enable filters
+        ws.auto_filter.ref = ws.dimensions
+        
+        # Freeze first row
+        ws.freeze_panes = 'A2'
 
     def _format_sheet(self, ws, color_map):
         header_font = Font(bold=True, color="FFFFFF")
